@@ -63,7 +63,7 @@ import org.nanohttpd.protocols.http.tempfiles.ITempFile;
 import org.nanohttpd.protocols.http.tempfiles.ITempFileManager;
 
 public class HTTPSession implements IHTTPSession {
-    
+
     public static final String POST_DATA = "postData";
 
     private static final int REQUEST_BUFFER_LEN = 512;
@@ -297,10 +297,8 @@ public class HTTPSession implements IHTTPSession {
         HeaderParser headerParser = new HeaderParser(is);
         HTTPHeader header = null;
 
-        while ( headerParser.hasNext() )
-        {
-            try
-            {
+        while (headerParser.hasNext()) {
+            try {
                 header = headerParser.next();
             } catch (BadHeaderException e) {
                 continue;
@@ -320,13 +318,13 @@ public class HTTPSession implements IHTTPSession {
         } else {
             this.headers.clear();
         }
-        //PushbackInputStream pis = new PushbackInputStream(this.inputStream);
-
+        // PushbackInputStream pis = new PushbackInputStream(this.inputStream);
 
         try {
             try {
                 readRequestLine(pre, this.inputStream);
                 this.method = Method.lookup(pre.get("method"));
+                this.protocolVersion = pre.get("http-version");
 
                 readHeaders(this.headers, this.inputStream);
                 this.uri = parseUri(this.parms, pre.get("uri"));
@@ -405,8 +403,7 @@ public class HTTPSession implements IHTTPSession {
      * the first two sequential new lines.
      */
     private int findHeaderEnd(final byte[] buf, int rlen) {
-        for ( int splitbyte = 0; splitbyte + 1 < rlen; splitbyte++ )
-        {
+        for (int splitbyte = 0; splitbyte + 1 < rlen; splitbyte++) {
 
             // RFC2616
             if (buf[splitbyte] == '\r' && buf[splitbyte + 1] == '\n' && splitbyte + 3 < rlen && buf[splitbyte + 2] == '\r' && buf[splitbyte + 3] == '\n') {
@@ -533,9 +530,8 @@ public class HTTPSession implements IHTTPSession {
     public long getBodySize() {
         if (this.headers.containsKey("content-length")) {
             return Long.parseLong(this.headers.get("content-length"));
-        } else if (this.splitbyte < this.rlen) {
-            return this.rlen - this.splitbyte;
         }
+
         return 0;
     }
 
@@ -548,10 +544,10 @@ public class HTTPSession implements IHTTPSession {
             DataOutput requestDataOutput = null;
 
             // Store the request in memory or a file, depending on size
-            if (size < MEMORY_STORE_LIMIT) {
+            if (size >= 0 && size < MEMORY_STORE_LIMIT) {
                 baos = new ByteArrayOutputStream();
                 requestDataOutput = new DataOutputStream(baos);
-            } else {
+            } else if (size >= 0) {
                 randomAccessFile = getTmpBucket();
                 requestDataOutput = randomAccessFile;
             }
