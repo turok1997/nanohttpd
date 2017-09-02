@@ -41,7 +41,7 @@ public class InvalidRequestTest extends HttpServerTest {
 
     @Test
     public void testGetRequestWithoutProtocol() {
-        invokeServer("GET " + HttpServerTest.URI + "\r\nX-Important-Header: foo");
+        invokeServer("GET " + HttpServerTest.URI + "\r\nX-Important-HTTPHeader: foo");
 
         assertNotNull(this.testServer.parms);
         assertNotNull(this.testServer.parameters);
@@ -52,7 +52,7 @@ public class InvalidRequestTest extends HttpServerTest {
 
     @Test
     public void testGetRequestWithProtocol() {
-        invokeServer("GET " + HttpServerTest.URI + " HTTP/1.1\r\nX-Important-Header: foo");
+        invokeServer("GET " + HttpServerTest.URI + " HTTP/1.1\r\nX-Important-HTTPHeader: foo");
 
         assertNotNull(this.testServer.parms);
         assertNotNull(this.testServer.parameters);

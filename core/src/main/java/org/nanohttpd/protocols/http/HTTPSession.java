@@ -33,18 +33,7 @@ package org.nanohttpd.protocols.http;
  * #L%
  */
 
-import java.io.BufferedInputStream;
-import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutput;
-import java.io.DataOutputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.io.RandomAccessFile;
+import java.io.*;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
@@ -65,6 +54,8 @@ import javax.net.ssl.SSLException;
 import org.nanohttpd.protocols.http.NanoHTTPD.ResponseException;
 import org.nanohttpd.protocols.http.content.ContentType;
 import org.nanohttpd.protocols.http.content.CookieHandler;
+import org.nanohttpd.protocols.http.headers.*;
+import org.nanohttpd.protocols.http.request.BadHeaderException;
 import org.nanohttpd.protocols.http.request.Method;
 import org.nanohttpd.protocols.http.response.Response;
 import org.nanohttpd.protocols.http.response.Status;
@@ -133,59 +124,16 @@ public class HTTPSession implements IHTTPSession {
     /**
      * Decodes the sent headers and loads the data into Key/value pairs
      */
-    private void decodeHeader(BufferedReader in, Map<String, String> pre, Map<String, List<String>> parms, Map<String, String> headers) throws ResponseException {
-        try {
-            // Read the request line
-            String inLine = in.readLine();
-            if (inLine == null) {
-                return;
-            }
+    private String parseUri(Map<String, List<String>> filledMap, String uri) {
+        // Decode parameters from the URI
+        int qmi = uri.indexOf('?');
 
-            StringTokenizer st = new StringTokenizer(inLine);
-            if (!st.hasMoreTokens()) {
-                throw new ResponseException(Status.BAD_REQUEST, "BAD REQUEST: Syntax error. Usage: GET /example/file.html");
-            }
-
-            pre.put("method", st.nextToken());
-
-            if (!st.hasMoreTokens()) {
-                throw new ResponseException(Status.BAD_REQUEST, "BAD REQUEST: Missing URI. Usage: GET /example/file.html");
-            }
-
-            String uri = st.nextToken();
-
-            // Decode parameters from the URI
-            int qmi = uri.indexOf('?');
-            if (qmi >= 0) {
-                decodeParms(uri.substring(qmi + 1), parms);
-                uri = NanoHTTPD.decodePercent(uri.substring(0, qmi));
-            } else {
-                uri = NanoHTTPD.decodePercent(uri);
-            }
-
-            // If there's another token, its protocol version,
-            // followed by HTTP headers.
-            // NOTE: this now forces header names lower case since they are
-            // case insensitive and vary by client.
-            if (st.hasMoreTokens()) {
-                protocolVersion = st.nextToken();
-            } else {
-                protocolVersion = "HTTP/1.1";
-                NanoHTTPD.LOG.log(Level.FINE, "no protocol version specified, strange. Assuming HTTP/1.1.");
-            }
-            String line = in.readLine();
-            while (line != null && !line.trim().isEmpty()) {
-                int p = line.indexOf(':');
-                if (p >= 0) {
-                    headers.put(line.substring(0, p).trim().toLowerCase(Locale.US), line.substring(p + 1).trim());
-                }
-                line = in.readLine();
-            }
-
-            pre.put("uri", uri);
-        } catch (IOException ioe) {
-            throw new ResponseException(Status.INTERNAL_ERROR, "SERVER INTERNAL ERROR: IOException: " + ioe.getMessage(), ioe);
+        if (qmi >= 0) {
+            decodeParms(uri.substring(qmi + 1), filledMap);
+            return NanoHTTPD.decodePercent(uri.substring(0, qmi));
         }
+
+        return NanoHTTPD.decodePercent(uri);
     }
 
     /**
@@ -206,7 +154,6 @@ public class HTTPSession implements IHTTPSession {
                 fbuf.get(partHeaderBuff, 0, len);
                 BufferedReader in =
                         new BufferedReader(new InputStreamReader(new ByteArrayInputStream(partHeaderBuff, 0, len), Charset.forName(contentType.getEncoding())), len);
-
                 int headerLines = 0;
                 // First line is boundary string
                 String mpline = in.readLine();
@@ -338,75 +285,70 @@ public class HTTPSession implements IHTTPSession {
         }
     }
 
+    private void readRequestLine(Map<String, String> filledMap, InputStream is) throws IOException, BadHeaderException, EmptyHeaderException {
+        RequestLineParser requestLineParser = new RequestLineParser(is);
+        HTTPRequestLine requestLine = requestLineParser.getRequestLine();
+        filledMap.put("method", requestLine.getHttpMethod().toString());
+        filledMap.put("uri", requestLine.getUri());
+        filledMap.put("http-version", requestLine.getHttpVersion());
+    }
+
+    private void readHeaders(Map<String, String> filledMap, InputStream is) throws IOException {
+        HeaderParser headerParser = new HeaderParser(is);
+        HTTPHeader header = null;
+
+        while ( headerParser.hasNext() )
+        {
+            try
+            {
+                header = headerParser.next();
+            } catch (BadHeaderException e) {
+                continue;
+            }
+
+            filledMap.put(header.getHeaderName().toLowerCase(Locale.US), header.getValue());
+        }
+    }
+
     @Override
     public void execute() throws IOException {
         Response r = null;
-        try {
-            // Read the first 8192 bytes.
-            // The full header should fit in here.
-            // Apache's default header limit is 8KB.
-            // Do NOT assume that a single read will get the entire header
-            // at once!
-            byte[] buf = new byte[HTTPSession.BUFSIZE];
-            this.splitbyte = 0;
-            this.rlen = 0;
+        Map<String, String> pre = new HashMap<String, String>();
+        this.parms = new HashMap<String, List<String>>();
+        if (null == this.headers) {
+            this.headers = new HashMap<String, String>();
+        } else {
+            this.headers.clear();
+        }
+        //PushbackInputStream pis = new PushbackInputStream(this.inputStream);
 
-            int read = -1;
-            this.inputStream.mark(HTTPSession.BUFSIZE);
+
+        try {
             try {
-                read = this.inputStream.read(buf, 0, HTTPSession.BUFSIZE);
+                readRequestLine(pre, this.inputStream);
+                this.method = Method.lookup(pre.get("method"));
+
+                readHeaders(this.headers, this.inputStream);
+                this.uri = parseUri(this.parms, pre.get("uri"));
+                pre.put("uri", this.uri);
             } catch (SSLException e) {
                 throw e;
             } catch (IOException e) {
                 NanoHTTPD.safeClose(this.inputStream);
                 NanoHTTPD.safeClose(this.outputStream);
                 throw new SocketException("NanoHttpd Shutdown");
-            }
-            if (read == -1) {
-                // socket was been closed
+            } catch (EmptyHeaderException e) {
                 NanoHTTPD.safeClose(this.inputStream);
                 NanoHTTPD.safeClose(this.outputStream);
                 throw new SocketException("NanoHttpd Shutdown");
+            } catch (BadHeaderException e) {
+                throw new ResponseException(Status.BAD_REQUEST, e.getMessage() + ". Bad line: " + e.getBadHeaderLine());
             }
-            while (read > 0) {
-                this.rlen += read;
-                this.splitbyte = findHeaderEnd(buf, this.rlen);
-                if (this.splitbyte > 0) {
-                    break;
-                }
-                read = this.inputStream.read(buf, this.rlen, HTTPSession.BUFSIZE - this.rlen);
-            }
-
-            if (this.splitbyte < this.rlen) {
-                this.inputStream.reset();
-                this.inputStream.skip(this.splitbyte);
-            }
-
-            this.parms = new HashMap<String, List<String>>();
-            if (null == this.headers) {
-                this.headers = new HashMap<String, String>();
-            } else {
-                this.headers.clear();
-            }
-
-            // Create a BufferedReader for parsing the header.
-            BufferedReader hin = new BufferedReader(new InputStreamReader(new ByteArrayInputStream(buf, 0, this.rlen)));
-
-            // Decode the header into parms and header java properties
-            Map<String, String> pre = new HashMap<String, String>();
-            decodeHeader(hin, pre, this.parms, this.headers);
 
             if (null != this.remoteIp) {
                 this.headers.put("remote-addr", this.remoteIp);
                 this.headers.put("http-client-ip", this.remoteIp);
             }
-
-            this.method = Method.lookup(pre.get("method"));
-            if (this.method == null) {
-                throw new ResponseException(Status.BAD_REQUEST, "BAD REQUEST: Syntax error. HTTP verb " + pre.get("method") + " unhandled.");
-            }
-
-            this.uri = pre.get("uri");
 
             this.cookies = new CookieHandler(this.headers);
 
@@ -440,11 +382,6 @@ public class HTTPSession implements IHTTPSession {
         } catch (SocketException e) {
             // throw it out to close socket object (finalAccept)
             throw e;
-        } catch (SocketTimeoutException ste) {
-            // treat socket timeouts the same way we treat socket exceptions
-            // i.e. close the stream & finalAccept object by throwing the
-            // exception up the call stack.
-            throw ste;
         } catch (SSLException ssle) {
             Response resp = Response.newFixedLengthResponse(Status.INTERNAL_ERROR, NanoHTTPD.MIME_PLAINTEXT, "SSL PROTOCOL FAILURE: " + ssle.getMessage());
             resp.send(this.outputStream);
@@ -468,8 +405,8 @@ public class HTTPSession implements IHTTPSession {
      * the first two sequential new lines.
      */
     private int findHeaderEnd(final byte[] buf, int rlen) {
-        int splitbyte = 0;
-        while (splitbyte + 1 < rlen) {
+        for ( int splitbyte = 0; splitbyte + 1 < rlen; splitbyte++ )
+        {
 
             // RFC2616
             if (buf[splitbyte] == '\r' && buf[splitbyte + 1] == '\n' && splitbyte + 3 < rlen && buf[splitbyte + 2] == '\r' && buf[splitbyte + 3] == '\n') {
@@ -480,7 +417,7 @@ public class HTTPSession implements IHTTPSession {
             if (buf[splitbyte] == '\n' && buf[splitbyte + 1] == '\n') {
                 return splitbyte + 2;
             }
-            splitbyte++;
+
         }
         return 0;
     }
@@ -633,6 +570,7 @@ public class HTTPSession implements IHTTPSession {
             if (baos != null) {
                 fbuf = ByteBuffer.wrap(baos.toByteArray(), 0, baos.size());
             } else {
+
                 fbuf = randomAccessFile.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, randomAccessFile.length());
                 randomAccessFile.seek(0);
             }
