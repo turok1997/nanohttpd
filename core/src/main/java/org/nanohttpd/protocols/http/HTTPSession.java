@@ -40,12 +40,8 @@ import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.StringTokenizer;
+import java.security.cert.CRL;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.regex.Matcher;
 
@@ -61,8 +57,11 @@ import org.nanohttpd.protocols.http.response.Response;
 import org.nanohttpd.protocols.http.response.Status;
 import org.nanohttpd.protocols.http.tempfiles.ITempFile;
 import org.nanohttpd.protocols.http.tempfiles.ITempFileManager;
+import org.nanohttpd.util.LineReader;
 
 public class HTTPSession implements IHTTPSession {
+
+    private int count = 0;
 
     public static final String POST_DATA = "postData";
 
@@ -92,17 +91,29 @@ public class HTTPSession implements IHTTPSession {
 
     private Map<String, List<String>> parms;
 
+    private int[] overlap;
+
     private Map<String, String> headers;
+
+    private Map<String, String> files;
 
     private CookieHandler cookies;
 
     private String queryParameterString;
+
+    private boolean newBoundaryFound = false;
 
     private String remoteIp;
 
     private String remoteHostname;
 
     private String protocolVersion;
+
+    private long occupiedBodyDataMemory;
+
+    private long lastLineSize = 0;
+
+    private long bodySize = 0;
 
     public HTTPSession(NanoHTTPD httpd, ITempFileManager tempFileManager, InputStream inputStream, OutputStream outputStream) {
         this.httpd = httpd;
@@ -119,6 +130,7 @@ public class HTTPSession implements IHTTPSession {
         this.remoteIp = inetAddress.isLoopbackAddress() || inetAddress.isAnyLocalAddress() ? "127.0.0.1" : inetAddress.getHostAddress().toString();
         this.remoteHostname = inetAddress.isLoopbackAddress() || inetAddress.isAnyLocalAddress() ? "localhost" : inetAddress.getHostName().toString();
         this.headers = new HashMap<String, String>();
+        this.files = new HashMap<>();
     }
 
     /**
@@ -136,6 +148,335 @@ public class HTTPSession implements IHTTPSession {
         return NanoHTTPD.decodePercent(uri);
     }
 
+    private long getFreeMemory() {
+        return Runtime.getRuntime().maxMemory() - (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory());
+    }
+
+    private void decodeMultipartFormData(InputStream is, ContentType contentType, Map<String, List<String>> parms, Map<String, String> files) throws IOException,
+            ResponseException {
+        if (bodySize <= 0)
+            return;
+        int pcount = 0;
+        byte[] CRLF_BUF = new byte[2];
+        byte[] boundary = contentType.getBoundary().getBytes();
+        HeaderParser headerParser = new HeaderParser(is);
+
+        // first line of body should be a boundary
+        String firstBoundary = readLine(boundary.length);
+        if (firstBoundary == null || !firstBoundary.substring(2).equals(contentType.getBoundary()))
+            throw new ResponseException(Status.BAD_REQUEST, "BAD REQUEST: Content type is multipart/form-data but doesn't start from a boundary");
+        bodySize -= lastLineSize;
+        System.out.println(firstBoundary);
+        newBoundaryFound = true;
+
+        while (newBoundaryFound) {
+            is.mark(2);
+            int read = is.read(CRLF_BUF, 0, 2);
+            if (read == -1)
+                break;
+            is.reset();
+            String partName = null;
+            String fileName = null;
+            String partContentType = null;
+            int headerCount = 0;
+            while (headerParser.hasNext()) {
+                HTTPHeader header = null;
+                try {
+                    header = headerParser.next();
+                    System.out.println(header);
+                    ++headerCount;
+                } catch (BadHeaderException e) {
+                    continue;
+                }
+                Matcher matcher = NanoHTTPD.CONTENT_DISPOSITION_PATTERN.matcher(header.toString());
+
+                if (matcher.matches()) {
+                    String attributeString = header.getValue();
+
+                    matcher = NanoHTTPD.CONTENT_DISPOSITION_ATTRIBUTE_PATTERN.matcher(attributeString);
+                    while (matcher.find()) {
+                        String key = matcher.group(1);
+                        if ("name".equalsIgnoreCase(key)) {
+                            partName = matcher.group(2);
+                        } else if ("filename".equalsIgnoreCase(key)) {
+                            fileName = matcher.group(2);
+                            // add these two line to support multiple
+                            // files uploaded using the same field Id
+                            if (!fileName.isEmpty()) {
+                                if (pcount > 0)
+                                    partName = partName + String.valueOf(pcount++);
+                                else
+                                    ++pcount;
+                            }
+                        }
+                    }
+                }
+
+                matcher = NanoHTTPD.CONTENT_TYPE_PATTERN.matcher(header.toString());
+                if (matcher.matches()) {
+                    partContentType = matcher.group(2).trim();
+                }
+            }
+
+            bodySize -= headerParser.getCurrentHeaderSize();
+
+            if (partName == null)
+                throw new NanoHTTPD.ResponseException(Status.BAD_REQUEST, "Multipart form data has a part with unknown field name");
+            // read actual data
+            List<String> values = parms.get(partName);
+            if (values == null) {
+                values = new ArrayList<String>();
+                parms.put(partName, values);
+            }
+
+            if (partContentType == null) {
+                // Read the part into a string
+                values.add(readPartPlainData(boundary));
+            } else {
+                // Read it into a file
+                String path = saveBodyPartIntoTempFile(is, boundary, fileName);
+                if (!files.containsKey(partName)) {
+                    files.put(partName, path);
+                } else {
+                    int count = 2;
+                    while (files.containsKey(partName + count)) {
+                        count++;
+                    }
+                    files.put(partName + count, path);
+                }
+                values.add(fileName);
+            }
+
+            // firstBoundary = readLine(boundary.length);
+            // if ( firstBoundary == null )
+            // break;
+            // bodySize -= lastLineSize;
+        }
+
+    }
+
+    private String saveBodyPartIntoTempFile(InputStream is, byte[] boundary, String filename) {
+
+        OutputStream fileOutputStream = null;
+        long total = 0;
+        try {
+            ITempFile tempFile = this.tempFileManager.createTempFile(filename);
+            fileOutputStream = tempFile.open();
+            byte[] buf = new byte[BUFSIZE];
+            int bufLength = 0;
+            byte[] possibleDelimiter = new byte[4];
+            int possibleDelimiterLength = 0;
+
+            int read = 1;
+            int k = 0;
+
+            // System.out.println("Starting reading. COntent size: " +
+            // bodySize);
+            long startTime = System.currentTimeMillis();
+            while (bodySize > 0 && read > 0) {
+                if (k == 0)
+                    is.mark(BUFSIZE);
+                // System.out.println("\n################################");
+                read = is.read(buf, k, (int) Math.min(bodySize, buf.length - k));
+                bufLength = k + read;
+                // System.out.println("Chunk of size: " + read + " left size: "
+                // + bodySize);
+                // System.out.println("Read " + read + " new bytes");
+                // System.out.println(new String(buf, 0, bufLength));
+
+                bodySize -= read;
+
+                int o = 0;
+                int bufIndex, patternIndex = o;
+                for (bufIndex = 0; bufIndex < bufLength;) {
+
+                    for (patternIndex = o; patternIndex < boundary.length && bufIndex + patternIndex < bufLength && buf[bufIndex + patternIndex] == boundary[patternIndex]; patternIndex++)
+                        ;
+
+                    if (patternIndex == boundary.length) {
+                        int impossibleDelimiterLength = Math.min(bufIndex, possibleDelimiterLength);
+
+                        // write byte that is impossible for delimiter
+                        fileOutputStream.write(possibleDelimiter, 0, impossibleDelimiterLength);
+                        total += impossibleDelimiterLength;
+                        // move possible delimiters to left
+                        System.arraycopy(possibleDelimiter, impossibleDelimiterLength, possibleDelimiter, 0, possibleDelimiterLength - impossibleDelimiterLength);
+                        // new length of possible delimiters
+                        possibleDelimiterLength = possibleDelimiterLength - impossibleDelimiterLength;
+                        // fhjghjg if have empty place fill with possible
+                        // delimiter
+                        // int emptySpace = possibleDelimiter.length -
+                        // possibleDelimiterLength;
+                        fileOutputStream.write(buf, 0, Math.max(0, bufIndex - possibleDelimiter.length));
+                        total += Math.max(0, bufIndex - possibleDelimiter.length);
+                        // System.arraycopy(buf, bufIndex-emptySpace,
+                        // possibleDelimiter, possibleDelimiterLength,
+                        // emptySpace);
+
+                        // System.out.println("Boundary found at i=" + bufIndex
+                        // + " and j = " + patternIndex + " Already written: " +
+                        // total);
+                        // fileOutputStream.write(buf, emptySpace,
+                        // bufIndex-emptySpace);
+
+                        is.reset();
+                        is.skip(bufIndex + patternIndex);
+                        bodySize += read - (bufIndex + patternIndex - k);
+
+                        // System.out.println("total written: " + total +
+                        // " . LEft size: " + bodySize);
+
+                        byte[] CRLF = new byte[4];
+                        int crlf_read = is.read(CRLF, 0, CRLF.length);
+                        bodySize -= crlf_read;
+                        if (crlf_read != 4 || CRLF[0] != '-' || CRLF[1] != '-')
+                            throw new ResponseException(Status.BAD_REQUEST, ":(");
+                        newBoundaryFound = false;
+                        long finishtTime = System.currentTimeMillis();
+                        // System.out.println("Total time: " + (finishtTime -
+                        // startTime));
+                        return tempFile.getName();
+                    }
+
+                    if (bufIndex + patternIndex == bufLength) {
+
+                        if (possibleDelimiterLength > 0) {
+                            fileOutputStream.write(possibleDelimiter, 0, possibleDelimiterLength);
+                            total += possibleDelimiterLength;
+                            possibleDelimiterLength = 0;
+                        }
+
+                        fileOutputStream.write(buf, 0, bufIndex - possibleDelimiter.length);
+                        total += bufIndex - possibleDelimiter.length;
+                        // System.out.println((bufIndex-possibleDelimiter.length)
+                        // + " bytes written into file");
+
+                        for (possibleDelimiterLength = 0; possibleDelimiterLength < possibleDelimiter.length; possibleDelimiterLength++)
+                            possibleDelimiter[possibleDelimiterLength] = buf[bufIndex - possibleDelimiter.length + possibleDelimiterLength];
+                        System.arraycopy(buf, bufIndex, buf, 0, patternIndex);
+
+                        // System.out.println("Possible delimiter: " + new
+                        // String(possibleDelimiter, 0,
+                        // possibleDelimiterLength));
+                        is.reset();
+                        is.skip(bufIndex);
+                        is.mark(BUFSIZE);
+                        is.skip(patternIndex);
+
+                        // System.out.println(new String(buf, 0, i));
+                        // System.out.println("omg this happened. " + bufIndex +
+                        // " will start at zero with j " + patternIndex);
+                        // System.out.println("buf[" + bufIndex + "] = " + new
+                        // String(buf, bufIndex, patternIndex));
+                        // System.out.println("Content size: " + bodySize);
+
+                        o = k = patternIndex;
+                        break;
+                    }
+
+                    o = Math.max(0, overlap[patternIndex]);
+                    bufIndex = bufIndex + Math.max(1, patternIndex - o);
+                }
+
+                if (bufIndex == bufLength) {
+                    // if ( bufLength == 1 )
+                    // System.out.println("yuppi");
+                    int impossibleDelimiterLength = Math.min(bufIndex, possibleDelimiterLength);
+
+                    // write byte that is impossible for delimiter
+                    fileOutputStream.write(possibleDelimiter, 0, impossibleDelimiterLength);
+                    total += impossibleDelimiterLength;
+                    // move possible delimiters to left
+                    System.arraycopy(possibleDelimiter, impossibleDelimiterLength, possibleDelimiter, 0, possibleDelimiterLength - impossibleDelimiterLength);
+                    // new length of possible delimiters
+                    possibleDelimiterLength = possibleDelimiterLength - impossibleDelimiterLength;
+                    // if have empty place, fill with possible delimiter
+                    int emptySpace = possibleDelimiter.length - possibleDelimiterLength;
+
+                    fileOutputStream.write(buf, 0, Math.max(0, bufIndex - possibleDelimiter.length));
+                    total += Math.max(0, bufIndex - possibleDelimiter.length);
+                    System.arraycopy(buf, bufIndex - emptySpace, possibleDelimiter, possibleDelimiterLength, emptySpace);
+                    possibleDelimiterLength += emptySpace;
+                    // System.out.println(buf.length-possibleDelimiter.length +
+                    // " bytes written into file");
+
+                    // save possible delimiters
+                    // System.arraycopy(buf, bufLength-possibleDelimiter.length,
+                    // possibleDelimiter, 0, possibleDelimiter.length);
+                    // possibleDelimiterLength = possibleDelimiter.length;
+
+                    k = 0;
+                    o = 0;
+                    // System.out.print(new String(buf, 0, read));
+                }
+            }
+            newBoundaryFound = false;
+            // System.out.println("happy end: " + total);
+            return null;
+
+            // fileOutputStream.write(buf, 0, k);
+        } catch (Exception error) {
+            throw new Error(error);
+        } finally {
+            // NanoHTTPD.safeClose(fileOutputStream);
+        }
+
+    }
+
+    private String readPartPlainData(byte[] boundary) throws IOException, ResponseException {
+        int read = -1;
+        int j = 0;
+        StringBuilder sb = new StringBuilder((int) Math.max(0, getAvailableDataMemory()));
+        inputStream.mark(boundary.length);
+        while ((read = this.inputStream.read()) != -1) {
+            sb.append((char) read);
+            occupiedBodyDataMemory++;
+            if (occupiedBodyDataMemory > MEMORY_STORE_LIMIT + boundary.length)
+                throw new ResponseException(Status.INTERNAL_ERROR, "Not enough memory");
+            while (true) {
+                if (boundary[j] == read) {
+                    j++;
+                    if (j == boundary.length) {
+                        j = overlap[j - 1];
+                        inputStream.reset();
+                        occupiedBodyDataMemory -= boundary.length;
+                        return sb.delete(sb.length() - boundary.length - 4, boundary.length + 4).toString();
+                    }
+                    break;
+                }
+
+                if (j == 0)
+                    break;
+
+                inputStream.reset();
+                inputStream.skip(Math.max(1, j + 1 - overlap[j]));
+                inputStream.mark(boundary.length);
+                j = overlap[j];
+                inputStream.skip(j);
+            }
+        }
+
+        return sb.toString();
+    }
+
+    private long getAvailableDataMemory() {
+        return Math.min(MEMORY_STORE_LIMIT - occupiedBodyDataMemory, getFreeMemory());
+    }
+
+    private void calcOverlap(byte[] pattern) {
+        overlap = new int[pattern.length + 1];
+        if (pattern.length == 0)
+            return;
+
+        overlap[0] = -1;
+
+        for (int i = 0; i < pattern.length; i++) {
+            overlap[i + 1] = overlap[i] + 1;
+            while (overlap[i + 1] > 0 && pattern[i] != pattern[overlap[i + 1] - 1])
+                overlap[i + 1] = overlap[overlap[i + 1] - 1] + 1;
+        }
+    }
+
     /**
      * Decodes the Multipart Body data and put it into Key/Value pairs.
      */
@@ -148,6 +489,7 @@ public class HTTPSession implements IHTTPSession {
             }
 
             byte[] partHeaderBuff = new byte[MAX_HEADER_SIZE];
+
             for (int boundaryIdx = 0; boundaryIdx < boundaryIdxs.length - 1; boundaryIdx++) {
                 fbuf.position(boundaryIdxs[boundaryIdx]);
                 int len = (fbuf.remaining() < MAX_HEADER_SIZE) ? fbuf.remaining() : MAX_HEADER_SIZE;
@@ -242,6 +584,28 @@ public class HTTPSession implements IHTTPSession {
         }
     }
 
+    private String readLine(int lengthHint) throws IOException {
+        int read = -1;
+        lastLineSize = 0;
+        StringBuilder sb = new StringBuilder(Math.max(lengthHint, 0));
+
+        while ((read = this.inputStream.read()) != -1 && read != '\n') {
+            sb.append((char) read);
+            ++lastLineSize;
+        }
+
+        if (read == '\n')
+            ++lastLineSize;
+
+        if (read == -1 && sb.length() == 0)
+            return null;
+
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) == '\r')
+            sb.deleteCharAt(sb.length() - 1);
+
+        return sb.toString();
+    }
+
     private int scipOverNewLine(byte[] partHeaderBuff, int index) {
         while (partHeaderBuff[index] != '\n') {
             index++;
@@ -291,9 +655,10 @@ public class HTTPSession implements IHTTPSession {
         filledMap.put("method", requestLine.getHttpMethod().toString());
         filledMap.put("uri", requestLine.getUri());
         filledMap.put("http-version", requestLine.getHttpVersion());
+        System.out.println(requestLine);
     }
 
-    private void readHeaders(Map<String, String> filledMap, InputStream is) throws IOException {
+    private void readHeaders(Map<String, String> filledMap, InputStream is) throws IOException, ResponseException {
         HeaderParser headerParser = new HeaderParser(is);
         HTTPHeader header = null;
 
@@ -305,6 +670,7 @@ public class HTTPSession implements IHTTPSession {
             }
 
             filledMap.put(header.getHeaderName().toLowerCase(Locale.US), header.getValue());
+            System.out.println(header.getHeaderName() + ": " + header.getValue());
         }
     }
 
@@ -342,6 +708,7 @@ public class HTTPSession implements IHTTPSession {
             } catch (BadHeaderException e) {
                 throw new ResponseException(Status.BAD_REQUEST, e.getMessage() + ". Bad line: " + e.getBadHeaderLine());
             }
+            count++;
 
             if (null != this.remoteIp) {
                 this.headers.put("remote-addr", this.remoteIp);
@@ -537,40 +904,9 @@ public class HTTPSession implements IHTTPSession {
 
     @Override
     public void parseBody(Map<String, String> files) throws IOException, ResponseException {
-        RandomAccessFile randomAccessFile = null;
+
         try {
-            long size = getBodySize();
-            ByteArrayOutputStream baos = null;
-            DataOutput requestDataOutput = null;
-
-            // Store the request in memory or a file, depending on size
-            if (size >= 0 && size < MEMORY_STORE_LIMIT) {
-                baos = new ByteArrayOutputStream();
-                requestDataOutput = new DataOutputStream(baos);
-            } else if (size >= 0) {
-                randomAccessFile = getTmpBucket();
-                requestDataOutput = randomAccessFile;
-            }
-
-            // Read all the body and write it to request_data_output
-            byte[] buf = new byte[REQUEST_BUFFER_LEN];
-            while (this.rlen >= 0 && size > 0) {
-                this.rlen = this.inputStream.read(buf, 0, (int) Math.min(size, REQUEST_BUFFER_LEN));
-                size -= this.rlen;
-                if (this.rlen > 0) {
-                    requestDataOutput.write(buf, 0, this.rlen);
-                }
-            }
-
-            ByteBuffer fbuf = null;
-            if (baos != null) {
-                fbuf = ByteBuffer.wrap(baos.toByteArray(), 0, baos.size());
-            } else {
-
-                fbuf = randomAccessFile.getChannel().map(FileChannel.MapMode.READ_ONLY, 0, randomAccessFile.length());
-                randomAccessFile.seek(0);
-            }
-
+            bodySize = getBodySize();
             // If the method is POST, there may be parameters
             // in data section, too, read it:
             if (Method.POST.equals(this.method)) {
@@ -580,11 +916,13 @@ public class HTTPSession implements IHTTPSession {
                     if (boundary == null) {
                         throw new ResponseException(Status.BAD_REQUEST, "BAD REQUEST: Content type is multipart/form-data but boundary missing. Usage: GET /example/file.html");
                     }
-                    decodeMultipartFormData(contentType, fbuf, this.parms, files);
+
+                    calcOverlap(contentType.getBoundary().getBytes());
+
+                    decodeMultipartFormData(this.inputStream, contentType, this.parms, files);
                 } else {
-                    byte[] postBytes = new byte[fbuf.remaining()];
-                    fbuf.get(postBytes);
-                    String postLine = new String(postBytes, contentType.getEncoding()).trim();
+                    String postLine = readRawContent(this.inputStream, bodySize);
+                    System.out.println(postLine);
                     // Handle application/x-www-form-urlencoded
                     if ("application/x-www-form-urlencoded".equalsIgnoreCase(contentType.getContentType())) {
                         decodeParms(postLine, this.parms);
@@ -596,10 +934,9 @@ public class HTTPSession implements IHTTPSession {
                     }
                 }
             } else if (Method.PUT.equals(this.method)) {
-                files.put("content", saveTmpFile(fbuf, 0, fbuf.limit(), null));
+                files.put("content", saveTmpFile(this.inputStream, null));
             }
         } finally {
-            NanoHTTPD.safeClose(randomAccessFile);
         }
     }
 
@@ -607,6 +944,48 @@ public class HTTPSession implements IHTTPSession {
      * Retrieves the content of a sent file and saves it to a temporary file.
      * The full path to the saved file is returned.
      */
+
+    private String readRawContent(InputStream is, long len) throws IOException {
+        if (len <= 0)
+            return "";
+        StringBuilder builder = new StringBuilder((int) getAvailableDataMemory());
+        byte[] buf = new byte[BUFSIZE];
+        int read = 0;
+        while (len > 0 && read >= 0) {
+            read = is.read(buf, 0, (int) Math.min(len, buf.length));
+            len -= read;
+
+            builder.append(new String(buf, 0, read));
+        }
+
+        return builder.toString();
+    }
+
+    private String saveTmpFile(InputStream is, String filename_hint) {
+        String path = "";
+        FileOutputStream fileOutputStream = null;
+
+        try {
+            byte[] buf = new byte[MEMORY_STORE_LIMIT];
+            ITempFile tempFile = this.tempFileManager.createTempFile(filename_hint);
+            path = tempFile.getName();
+            fileOutputStream = new FileOutputStream(tempFile.getName());
+            int read = 0;
+            while (bodySize > 0 && read >= 0) {
+                read = is.read(buf, 0, (int) Math.min(bodySize, buf.length));
+                bodySize -= read;
+                fileOutputStream.write(buf, 0, read);
+            }
+
+        } catch (Exception e) {
+            throw new Error(e);
+        } finally {
+            NanoHTTPD.safeClose(fileOutputStream);
+        }
+
+        return path;
+    }
+
     private String saveTmpFile(ByteBuffer b, int offset, int len, String filename_hint) {
         String path = "";
         if (len > 0) {

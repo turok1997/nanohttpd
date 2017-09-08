@@ -33,7 +33,10 @@ package org.nanohttpd.protocols.http.headers;
  * #L%
  */
 
+import org.nanohttpd.protocols.http.HTTPSession;
+import org.nanohttpd.protocols.http.NanoHTTPD;
 import org.nanohttpd.protocols.http.request.BadHeaderException;
+import org.nanohttpd.protocols.http.response.Status;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -53,28 +56,35 @@ public class HeaderParser {
 
     private int headerSizeInBytes = 0;
 
-    public HeaderParser(InputStream markableInputStream) {
+    private int maxHeadersSize;
 
-        this.inputStream = new PushbackInputStream(markableInputStream, CRLF_LENGTH);
+    public HeaderParser(InputStream markableInputStream) {
+        this(markableInputStream, HTTPSession.MAX_HEADER_SIZE);
     }
 
-    public boolean hasNext() throws IOException {
+    public HeaderParser(InputStream markableInputStream, int headerSizeLimit) {
+        this.inputStream = new PushbackInputStream(markableInputStream, CRLF_LENGTH);
+        this.maxHeadersSize = headerSizeLimit;
+    }
+
+    public boolean hasNext() throws IOException, NanoHTTPD.ResponseException {
         int read = inputStream.read(CRLF_BUF);
         if (read == -1)
             return false;
 
         boolean hasNext = true;
 
-        if (read == 1)
-            hasNext = CRLF_BUF[0] != '\n';
-
-        if (read == 2)
-            hasNext = (CRLF_BUF[0] != '\r' || CRLF_BUF[1] != '\n') && CRLF_BUF[0] != '\n';
-
-        // tolerance
         if (CRLF_BUF[0] == '\n') {
             hasNext = false;
-            inputStream.unread(CRLF_BUF, 1, 1);
+            inputStream.unread(CRLF_BUF, 1, read - 1);
+            headerSizeInBytes++;
+            if (headerSizeInBytes > maxHeadersSize)
+                throw new NanoHTTPD.ResponseException(Status.INTERNAL_ERROR, "Multipart header size exceeds MAX_HEADER_SIZE.");
+        } else if (read == 2 && CRLF_BUF[0] == '\r' && CRLF_BUF[1] == '\n') {
+            hasNext = false;
+            headerSizeInBytes += 2;
+            if (headerSizeInBytes > maxHeadersSize)
+                throw new NanoHTTPD.ResponseException(Status.INTERNAL_ERROR, "Multipart header size exceeds MAX_HEADER_SIZE.");
         }
 
         if (hasNext) {
@@ -84,35 +94,46 @@ public class HeaderParser {
         return hasNext;
     }
 
-    public HTTPHeader next() throws IOException, BadHeaderException {
+    public HTTPHeader next() throws IOException, BadHeaderException, NanoHTTPD.ResponseException {
         String headerName = getHeaderName();
         String value = getHeaderValue();
 
         return new HTTPHeader(headerName, value);
     }
 
-    private String getHeaderName() throws IOException, BadHeaderException {
+    private String getHeaderName() throws IOException, BadHeaderException, NanoHTTPD.ResponseException {
 
         StringBuilder headerName = new StringBuilder(HTTP_METHOD_AVERAGE_LENGTH);
 
         int read = -1;
         while ((read = inputStream.read()) != -1 && ((char) read) != ':' && ((char) read) != '\n') {
             headerName.append((char) read);
+            headerSizeInBytes++;
+            if (headerSizeInBytes > maxHeadersSize)
+                throw new NanoHTTPD.ResponseException(Status.INTERNAL_ERROR, "Multipart header size exceeds MAX_HEADER_SIZE.");
         }
 
-        if (read == -1 || read == '\n')
+        headerSizeInBytes += read == -1 ? 0 : 1;
+
+        if (read == -1 || read == '\n') {
             throw new BadHeaderException(headerName.toString(), "BAD REQUEST: Syntax error. Header " + headerName + " is not complete. Example HeaderName: Value");
+        }
 
         return headerName.toString().trim();
     }
 
-    private String getHeaderValue() throws IOException {
+    private String getHeaderValue() throws IOException, NanoHTTPD.ResponseException {
         StringBuilder value = new StringBuilder();
 
         int read = -1;
         while ((read = inputStream.read()) != -1 && ((char) read) != '\n') {
             value.append((char) read);
+            headerSizeInBytes++;
+            if (headerSizeInBytes > maxHeadersSize)
+                throw new NanoHTTPD.ResponseException(Status.INTERNAL_ERROR, "Multipart header size exceeds MAX_HEADER_SIZE.");
         }
+
+        headerSizeInBytes += read == -1 ? 0 : 1;
 
         if (value.length() > 0 && value.charAt(value.length() - 1) == '\r')
             value.deleteCharAt(value.length() - 1);
@@ -123,5 +144,9 @@ public class HeaderParser {
     private boolean isEnglishLetter(char c) {
 
         return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    }
+
+    public int getCurrentHeaderSize() {
+        return headerSizeInBytes;
     }
 }

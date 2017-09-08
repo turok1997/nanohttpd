@@ -1,4 +1,4 @@
-package org.nanohttpd.protocols.http.headers;
+package org.nanohttpd.util;
 
 /*
  * #%L
@@ -33,50 +33,24 @@ package org.nanohttpd.protocols.http.headers;
  * #L%
  */
 
-import org.nanohttpd.protocols.http.request.BadHeaderException;
-import org.nanohttpd.protocols.http.request.BadRequestLineException;
-import org.nanohttpd.protocols.http.request.Method;
+import java.io.IOException;
+import java.io.InputStream;
 
-public class HTTPRequestLine {
+public class LineReader {
 
-    private Method httpMethod;
+    public static String readLine(InputStream is) throws IOException {
+        int read = -1;
+        StringBuilder sb = new StringBuilder(10);
 
-    private String uri;
+        while ((read = is.read()) != -1 && read != '\n') {
+            sb.append((char) read);
+            System.out.print((char) read);
+        }
+        if (read == -1 && sb.length() == 0)
+            return null;
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) == '\r')
+            sb.deleteCharAt(sb.length() - 1);
 
-    private String httpVersion;
-
-    private String requestLine;
-
-    public HTTPRequestLine(String httpMethod, String uri, String httpVersion) throws BadHeaderException {
-
-        this.requestLine = httpMethod + " " + uri + " " + httpVersion;
-        this.httpMethod = Method.lookup(httpMethod);
-        if (this.httpMethod == null)
-            throw new BadRequestLineException(requestLine, "BAD REQUEST: Syntax error. " + httpMethod + " is not specified in RFC. ");
-
-        this.uri = uri;
-        if (uri == null)
-            throw new BadHeaderException(null, "BAD REQUEST: Missing URI. Usage: GET /example/file.html");
-
-        this.httpVersion = httpVersion;
-        if (this.httpVersion == null)
-            httpVersion = "HTTP/1.1";
-    }
-
-    public Method getHttpMethod() {
-        return httpMethod;
-    }
-
-    public String getUri() {
-        return uri;
-    }
-
-    public String getHttpVersion() {
-        return httpVersion;
-    }
-
-    @Override
-    public String toString() {
-        return requestLine;
+        return sb.toString();
     }
 }

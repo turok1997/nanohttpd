@@ -39,6 +39,8 @@ public class HTTPHeader {
 
     private String value;
 
+    private String headerLine;
+
     public HTTPHeader(String headerName, String value) {
         this.headerName = headerName;
         if (this.headerName == null)
@@ -47,6 +49,7 @@ public class HTTPHeader {
         this.value = value;
         if (this.value == null)
             this.value = "";
+        this.headerLine = this.headerName + ": " + this.value;
     }
 
     public String getHeaderName() {
@@ -55,5 +58,10 @@ public class HTTPHeader {
 
     public String getValue() {
         return value;
+    }
+
+    @Override
+    public String toString() {
+        return this.headerLine;
     }
 }

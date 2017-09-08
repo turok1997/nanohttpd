@@ -34,28 +34,26 @@ package org.nanohttpd.protocols.http.headers;
  */
 
 import org.nanohttpd.protocols.http.request.BadHeaderException;
-import org.nanohttpd.protocols.http.request.BadRequestLineException;
-import org.nanohttpd.protocols.http.request.Method;
-import org.nanohttpd.util.IPushbackByteReader;
+import org.nanohttpd.util.LineReader;
 
 import java.io.*;
 import java.util.StringTokenizer;
 
 public class RequestLineParser {
 
-    private InputStream requestReader;
+    private InputStream requestStream;
 
     private StringTokenizer lineTokenizer;
 
     private int lastByte = -1;
 
     public RequestLineParser(InputStream inputStream) {
-        this.requestReader = inputStream;
+        this.requestStream = inputStream;
     }
 
     public HTTPRequestLine getRequestLine() throws BadHeaderException, IOException, EmptyHeaderException {
 
-        String requestLine = readLine();
+        String requestLine = LineReader.readLine(this.requestStream);
         if (requestLine == null)
             throw new EmptyHeaderException("BAD REQUEST. No request line. Seems the end of stream is reached");
 
@@ -89,21 +87,6 @@ public class RequestLineParser {
         if (lineTokenizer.hasMoreTokens())
             return lineTokenizer.nextToken();
         return null;
-    }
-
-    private String readLine() throws IOException {
-        int read = -1;
-        StringBuilder sb = new StringBuilder(10);
-
-        while ((read = requestReader.read()) != -1 && read != '\n') {
-            sb.append((char) read);
-        }
-        if (read == -1 && sb.length() == 0)
-            return null;
-        if (sb.length() > 0 && sb.charAt(sb.length() - 1) == '\r')
-            sb.deleteCharAt(sb.length() - 1);
-
-        return sb.toString();
     }
 
 }

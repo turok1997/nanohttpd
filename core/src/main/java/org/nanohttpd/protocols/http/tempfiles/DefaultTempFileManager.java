@@ -57,8 +57,8 @@ public class DefaultTempFileManager implements ITempFileManager {
     private final List<ITempFile> tempFiles;
 
     public DefaultTempFileManager() {
-        // this.tmpdir = new File(System.getProperty("java.io.tmpdir"));
-        this.tmpdir = new File("/home/turok/Downloads/pox");
+        this.tmpdir = new File(System.getProperty("java.io.tmpdir"));
+        // this.tmpdir = new File("/home/turok/Downloads/pox");
         if (!tmpdir.exists()) {
             tmpdir.mkdirs();
         }
