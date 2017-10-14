@@ -58,10 +58,10 @@ public class CookieHandler implements Iterable<String> {
         if (raw != null) {
             String[] tokens = raw.split(";");
             for (String token : tokens) {
-                String[] data = token.trim().split("=");
-                if (data.length == 2) {
-                    this.cookies.put(data[0], data[1]);
-                }
+                int equalSignPos = token.indexOf('=');
+                if (equalSignPos == -1)
+                    continue;
+                this.cookies.put(token.substring(0, equalSignPos), token.substring(equalSignPos + 1));
             }
         }
     }
