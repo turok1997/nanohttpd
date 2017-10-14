@@ -222,6 +222,9 @@ public class HTTPSession implements IHTTPSession {
 
             if (partName == null)
                 throw new NanoHTTPD.ResponseException(Status.BAD_REQUEST, "Multipart form data has a part with unknown field name");
+            if (fileName != null) {
+
+            }
             // read actual data
             List<String> values = parms.get(partName);
             if (values == null) {
@@ -418,7 +421,7 @@ public class HTTPSession implements IHTTPSession {
         } catch (Exception error) {
             throw new Error(error);
         } finally {
-            // NanoHTTPD.safeClose(fileOutputStream);
+            NanoHTTPD.safeClose(fileOutputStream);
         }
 
     }
