@@ -61,7 +61,7 @@ public class CookieHandler implements Iterable<String> {
                 int equalSignPos = token.indexOf('=');
                 if (equalSignPos == -1)
                     continue;
-                this.cookies.put(token.substring(0, equalSignPos), token.substring(equalSignPos + 1));
+                this.cookies.put(token.substring(0, equalSignPos).trim(), token.substring(equalSignPos + 1));
             }
         }
     }
